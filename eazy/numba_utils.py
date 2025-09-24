@@ -252,6 +252,337 @@ def template_lsq_numba_covar(
             
     return chi2_i, coeffs_i, fmodel, covar
 
+'''
+@numba.njit(cache=True, fastmath=True)
+def template_lsq_numba_covar(
+    fnu_i: NDArray,
+    efnu_i: NDArray,
+    Ain: NDArray,
+    TEFz: NDArray,
+    zp: NDArray,
+    renorm_t: bool,
+    hess_threshold: float,
+) -> Tuple[float, NDArray, NDArray, NDArray]:
+    """
+    Numba implementation of template_lsq that also returns the correctly scaled
+    covariance matrix.
+    """
+    NTEMP, NFILT = Ain.shape
+    MIN_VALID_FILTERS = 1
+
+    ok_band = (efnu_i / zp > 0) & np.isfinite(fnu_i) & np.isfinite(efnu_i)
+    
+    empty_coeffs = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    empty_covar = np.full((NTEMP, NTEMP), np.nan, dtype=np.float64)
+
+    if np.sum(ok_band) < MIN_VALID_FILTERS:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    var = efnu_i**2 + (TEFz * np.maximum(fnu_i, 0.0))**2
+    rms = np.sqrt(var)
+    A_ok = Ain[:, ok_band]
+    rms_ok = rms[ok_band]
+    
+    Anorm = np.ones(NTEMP, dtype=fnu_i.dtype)
+    if renorm_t:
+        for i in range(NTEMP):
+            norm_val = np.sqrt(np.sum((A_ok[i, :] / rms_ok)**2))
+            if norm_val > 0:
+                Anorm[i] = norm_val
+
+    A = np.zeros_like(Ain)
+    for i in range(NTEMP):
+        A[i, :] = Ain[i, :] / Anorm[i]
+
+    ok_temp = Anorm > 0
+    if np.sum(ok_temp) == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    Ax = np.zeros((np.sum(ok_band), NTEMP), dtype=fnu_i.dtype)
+    for i in range(NTEMP):
+        Ax[:, i] = A[i, ok_band] / rms_ok
+        
+    if hess_threshold < 1.0:
+        Hess = np.dot(Ax.T, Ax)
+        temp_indices = np.where(ok_temp)[0]
+        for i_idx, i in enumerate(temp_indices):
+            if not ok_temp[i]: continue
+            for j in temp_indices[i_idx + 1:]:
+                if Hess[i, j] > hess_threshold: ok_temp[j] = False
+
+    active_temps = np.sum(ok_temp)
+    if active_temps == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+        
+    Ax_fit = np.ascontiguousarray(Ax[:, ok_temp])
+    b = fnu_i[ok_band] / rms_ok
+    coeffs_x, _ = _nnls_numba(Ax_fit.astype(np.float64), b.astype(np.float64))
+
+    coeffs_i = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    coeffs_i[ok_temp] = coeffs_x.astype(fnu_i.dtype)
+    
+    fmodel = np.dot(coeffs_i, A)
+    chi2_i = np.sum(((fnu_i[ok_band] - fmodel[ok_band])**2) / var[ok_band])
+    
+    # Un-scale coefficients
+    coeffs_i /= Anorm
+    fmodel = np.dot(coeffs_i, Ain)
+
+    # Calculate and un-scale the covariance matrix
+    active_mask = coeffs_i > 0
+    n_active = np.sum(active_mask)
+    
+    if n_active > 0:
+        # Use the same templates that were used for fitting
+        Ax_active = Ax_fit  # This is already the correct subset
+        hessian = np.dot(Ax_active.T, Ax_active)
+        hessian += np.eye(n_active) * 1e-8
+        
+        try:
+            covar_scaled = np.linalg.inv(hessian.astype(np.float64))
+            
+            # Un-scale the covariance matrix before returning
+            active_indices = np.where(ok_temp)[0]
+            Anorm_active = Anorm[active_indices]
+            
+            # Fix the indexing issue: use proper matrix indices
+            for r_idx in range(n_active):
+                for c_idx in range(n_active):
+                    r = active_indices[r_idx]
+                    c = active_indices[c_idx]
+                    unscaled_cov = covar_scaled[r_idx, c_idx] / (Anorm_active[r_idx] * Anorm_active[c_idx])
+                    empty_covar[r, c] = unscaled_cov
+        except:
+            # Failed to invert, covar remains NaN
+            pass
+            
+    return chi2_i, coeffs_i, fmodel, empty_covar
+
+@numba.njit(cache=True, fastmath=True)
+def template_lsq_numba_covar(
+    fnu_i: NDArray,
+    efnu_i: NDArray,
+    Ain: NDArray,
+    TEFz: NDArray,
+    zp: NDArray,
+    renorm_t: bool,
+    hess_threshold: float,
+) -> Tuple[float, NDArray, NDArray, NDArray]:
+    """
+    Numba implementation of template_lsq that also returns the correctly scaled
+    covariance matrix.
+    """
+    NTEMP, NFILT = Ain.shape
+    MIN_VALID_FILTERS = 1
+
+    ok_band = (efnu_i / zp > 0) & np.isfinite(fnu_i) & np.isfinite(efnu_i)
+    
+    empty_coeffs = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    empty_covar = np.full((NTEMP, NTEMP), np.nan, dtype=np.float64)
+
+    if np.sum(ok_band) < MIN_VALID_FILTERS:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    var = efnu_i**2 + (TEFz * np.maximum(fnu_i, 0.0))**2
+    rms = np.sqrt(var)
+    A_ok = Ain[:, ok_band]
+    rms_ok = rms[ok_band]
+    
+    Anorm = np.ones(NTEMP, dtype=fnu_i.dtype)
+    if renorm_t:
+        for i in range(NTEMP):
+            norm_val = np.sqrt(np.sum((A_ok[i, :] / rms_ok)**2))
+            if norm_val > 0:
+                Anorm[i] = norm_val
+
+    A = np.zeros_like(Ain)
+    for i in range(NTEMP):
+        A[i, :] = Ain[i, :] / Anorm[i]
+
+    ok_temp = Anorm > 0
+    if np.sum(ok_temp) == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    Ax = np.zeros((np.sum(ok_band), NTEMP), dtype=fnu_i.dtype)
+    for i in range(NTEMP):
+        Ax[:, i] = A[i, ok_band] / rms_ok
+        
+    if hess_threshold < 1.0:
+        Hess = np.dot(Ax.T, Ax)
+        temp_indices = np.where(ok_temp)[0]
+        for i_idx, i in enumerate(temp_indices):
+            if not ok_temp[i]: continue
+            for j in temp_indices[i_idx + 1:]:
+                if Hess[i, j] > hess_threshold: ok_temp[j] = False
+
+    active_temps = np.sum(ok_temp)
+    if active_temps == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+        
+    Ax_fit = np.ascontiguousarray(Ax[:, ok_temp])
+    b = fnu_i[ok_band] / rms_ok
+    coeffs_x, _ = _nnls_numba(Ax_fit.astype(np.float64), b.astype(np.float64))
+
+    coeffs_i = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    coeffs_i[ok_temp] = coeffs_x.astype(fnu_i.dtype)
+    
+    fmodel = np.dot(coeffs_i, A)
+    chi2_i = np.sum(((fnu_i[ok_band] - fmodel[ok_band])**2) / var[ok_band])
+    
+    # Un-scale coefficients
+    coeffs_i /= Anorm
+    fmodel = np.dot(coeffs_i, Ain)
+
+    # Calculate and un-scale the covariance matrix
+    # Use ok_temp (the templates actually used in fitting) instead of active_mask
+    n_active = np.sum(ok_temp)
+    
+    if n_active > 0:
+        # Use the same templates that were used for fitting
+        Ax_active = Ax_fit  # This is already the correct subset
+        hessian = np.dot(Ax_active.T, Ax_active)
+        hessian += np.eye(n_active) * 1e-8
+        
+        try:
+            covar_scaled = np.linalg.inv(hessian.astype(np.float64))
+            
+            # Un-scale the covariance matrix before returning
+            active_indices = np.where(ok_temp)[0]
+            Anorm_active = Anorm[active_indices]
+            
+            # Fix the indexing issue: use proper matrix indices
+            for r_idx in range(n_active):
+                for c_idx in range(n_active):
+                    r = active_indices[r_idx]
+                    c = active_indices[c_idx]
+                    unscaled_cov = covar_scaled[r_idx, c_idx] / (Anorm_active[r_idx] * Anorm_active[c_idx])
+                    empty_covar[r, c] = unscaled_cov
+        except:
+            # Failed to invert, covar remains NaN
+            pass
+  
+    return chi2_i, coeffs_i, fmodel, empty_covar
+
+
+@numba.njit(cache=True, fastmath=True)
+def template_lsq_numba_covar(
+    fnu_i: NDArray,
+    efnu_i: NDArray,
+    Ain: NDArray,
+    TEFz: NDArray,
+    zp: NDArray,
+    renorm_t: bool,
+    hess_threshold: float,
+) -> Tuple[float, NDArray, NDArray, NDArray]:
+    """
+    Numba implementation of template_lsq that also returns the correctly scaled
+    covariance matrix.
+    """
+    NTEMP, NFILT = Ain.shape
+    MIN_VALID_FILTERS = 1
+
+    ok_band = (efnu_i / zp > 0) & np.isfinite(fnu_i) & np.isfinite(efnu_i)
+    
+    empty_coeffs = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    empty_covar = np.full((NTEMP, NTEMP), np.nan, dtype=np.float64)
+
+    if np.sum(ok_band) < MIN_VALID_FILTERS:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    var = efnu_i**2 + (TEFz * np.maximum(fnu_i, 0.0))**2
+    rms = np.sqrt(var)
+    A_ok = Ain[:, ok_band]
+    rms_ok = rms[ok_band]
+    
+    Anorm = np.ones(NTEMP, dtype=fnu_i.dtype)
+    if renorm_t:
+        for i in range(NTEMP):
+            norm_val = np.sqrt(np.sum((A_ok[i, :] / rms_ok)**2))
+            if norm_val > 0:
+                Anorm[i] = norm_val
+
+    A = np.zeros_like(Ain)
+    for i in range(NTEMP):
+        A[i, :] = Ain[i, :] / Anorm[i]
+
+    ok_temp = Anorm > 0
+    if np.sum(ok_temp) == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+
+    Ax = np.zeros((np.sum(ok_band), NTEMP), dtype=fnu_i.dtype)
+    for i in range(NTEMP):
+        Ax[:, i] = A[i, ok_band] / rms_ok
+        
+    if hess_threshold < 1.0:
+        Hess = np.dot(Ax.T, Ax)
+        temp_indices = np.where(ok_temp)[0]
+        for i_idx, i in enumerate(temp_indices):
+            if not ok_temp[i]: continue
+            for j in temp_indices[i_idx + 1:]:
+                if Hess[i, j] > hess_threshold: ok_temp[j] = False
+
+    active_temps = np.sum(ok_temp)
+    if active_temps == 0:
+        fmodel = np.dot(empty_coeffs, Ain)
+        return np.inf, empty_coeffs, fmodel, empty_covar
+        
+    Ax_fit = np.ascontiguousarray(Ax[:, ok_temp])
+    b = fnu_i[ok_band] / rms_ok
+    coeffs_x, _ = _nnls_numba(Ax_fit.astype(np.float64), b.astype(np.float64))
+
+    coeffs_i = np.zeros(NTEMP, dtype=fnu_i.dtype)
+    coeffs_i[ok_temp] = coeffs_x.astype(fnu_i.dtype)
+    
+    # Calculate chi2 using scaled templates (A, not Ain)
+    fmodel_scaled = np.dot(coeffs_i, A)
+    chi2_i = np.sum(((fnu_i[ok_band] - fmodel_scaled[ok_band])**2) / var[ok_band])
+    
+    # Un-scale coefficients
+    for i in range(NTEMP):
+        coeffs_i[i] /= Anorm[i]
+    fmodel = np.dot(coeffs_i, Ain)
+
+    # Calculate covariance matrix using the same approach as the original
+    # Only calculate for templates with non-zero coefficients (active in fit)
+    final_active_mask = coeffs_i > 0
+    n_active = np.sum(final_active_mask)
+    
+    if n_active > 0:
+        try:
+            # Use Ax (scaled design matrix) for active templates only
+            Ax_active = Ax[:, final_active_mask]
+            hessian = np.dot(Ax_active.T, Ax_active)
+            
+            # Add regularization for numerical stability
+            hessian += np.eye(n_active) * 1e-8
+            
+            # Invert to get scaled covariance
+            covar_scaled = np.linalg.inv(hessian.astype(np.float64))
+            
+            # Un-scale the covariance matrix
+            active_indices = np.where(final_active_mask)[0]
+            for r_idx in range(n_active):
+                for c_idx in range(n_active):
+                    r = active_indices[r_idx]
+                    c = active_indices[c_idx]
+                    # Un-scale: multiply by normalization factors
+                    unscaled_cov = covar_scaled[r_idx, c_idx] * Anorm[r] * Anorm[c]
+                    empty_covar[r, c] = unscaled_cov
+                    
+        except:
+            # Matrix inversion failed, leave covariance as NaN
+            pass
+  
+    return chi2_i, coeffs_i, fmodel, empty_covar
+'''
 
 @numba.njit(cache=True, fastmath=True)
 def _single_object_rest_fluxes_refit(

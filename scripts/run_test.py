@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
     phot = Table.read(catalog, hdu='OBJECTS')
     # filter to first 10,000 galaxies
-    phot = phot[:10_000]
+    phot = phot[:100_000]
     flux_col = [phot[f'FLUX_APER_{band}_aper_corr_Jy'] for band in filters]
     flux_err_col = [phot[f'FLUXERR_APER_{band}_loc_depth_10pc_Jy'] for band in filters]
     ids = phot['UNIQUE_ID']
@@ -172,7 +172,7 @@ if __name__ == "__main__":
 
     print("Running Numba version of standard_output...")
     start = time.time()
-    ez.standard_output(use_numba=True, vnorm_type=1)
+    ez.standard_output(use_numba=True, vnorm_type=1, n_proc=4)
     end = time.time()
     numba_output_time = end - start
     
@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
     print("Running original version of standard_output...")
     start = time.time()
-    ez.standard_output(use_numba=False, vnorm_type=1)
+    ez.standard_output(use_numba=False, vnorm_type=1, n_proc=4)
     end = time.time()
     orig_output_time = end - start
 

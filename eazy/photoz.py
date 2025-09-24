@@ -3624,8 +3624,8 @@ class PhotoZ(object):
                     (idx[i::skip],
                      fnu_corr[idx[i::skip],:], efnu_corr[idx[i::skip],:],
                      izbest[idx[i::skip]], self.zbest[idx[i::skip]])
-                     + worker_args_tuple[4:],
-                    threads=skip
+                     + worker_args_tuple[4:], 
+                    kwds={'threads': skip}
                 )
                 for i in range(skip)
             ]
@@ -6695,7 +6695,7 @@ def _fit_at_zbest_group(ix, fnu_corr, efnu_corr, zbest, zp, get_err, fitter, ren
             
     return ix, coeffs_best, fmodel, efmodel, chi2_best, coeffs_draws
 
-def _fit_rest_group(ix, fnu_corr, efnu_corr, izbest, zbest, zp, get_err, fitter, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentiles, rf_lc, pad_width, max_err, threads):
+def _fit_rest_group(ix, fnu_corr, efnu_corr, izbest, zbest, zp, get_err, fitter, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentiles, rf_lc, pad_width, max_err, threads=0):
     """
     Standalone function for fitting rest-frame fluxes for individual objects
     """
@@ -7050,7 +7050,7 @@ def template_lsq(fnu_i, efnu_i, Ain, TEFz, zp, ndraws, fitter, renorm_t, hess_th
 
     return chi2_i, coeffs_i, fmodel, coeffs_draw
 
-def _fit_rest_group_numba(ix, fnu_corr, efnu_corr, izbest, zbest, zp, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentile_sigma_multipliers, rf_lc, pivot, pad_width, max_err, threads):
+def _fit_rest_group_numba(ix, fnu_corr, efnu_corr, izbest, zbest, zp, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentile_sigma_multipliers, rf_lc, pivot, pad_width, max_err, threads=0):
     """
     Multiprocessing worker for numba-based rest-frame flux calculation.
     """

@@ -343,6 +343,7 @@ def _rest_frame_fluxes_numba_simple(
             
     return f_rest
 
+'''
 @numba.njit(cache=True, fastmath=True)
 def _single_object_fit_at_zbest_numba(
     fnu_i: NDArray,
@@ -384,3 +385,80 @@ def _single_object_fit_at_zbest_numba(
         efmodel = np.sqrt(var_fmodel)
 
     return chi2, coeffs, fmodel, efmodel
+'''
+
+# Add this new function to the top of your numba_utils.py
+@numba.njit(nopython=True, cache=True)
+def multivariate_normal_numba(mean, cov, size):
+    """Numba-compatible multivariate normal random number generator."""
+    n_dim = len(mean)
+    samples = np.zeros((size, n_dim), dtype=mean.dtype)
+    try:
+        L = np.linalg.cholesky(cov)
+    except Exception:
+        # If Cholesky decomposition fails, return NaNs
+        samples[:, :] = np.nan
+        return samples
+        
+    for i in numba.prange(size):
+        z = np.random.randn(n_dim)
+        samples[i, :] = mean + L @ z.astype(mean.dtype)
+    return samples
+
+@numba.njit(cache=True, fastmath=True)
+def _single_object_fit_at_zbest_numba(
+    fnu_i: NDArray,
+    efnu_i: NDArray,
+    A: NDArray,
+    TEFz: NDArray,
+    zp: NDArray,
+    ndraws: int,
+    renorm_t: bool,
+    hess_threshold: float,
+) -> Tuple[float, NDArray, NDArray, NDArray, NDArray]:
+    """
+    Numba kernel to fit a single object, get analytical errors, and generate proper multivariate draws.
+    """
+    ndraws_int = int(ndraws)
+    NTEMP = A.shape[0]
+    chi2, coeffs, fmodel, covar = template_lsq_numba_covar(
+        fnu_i, efnu_i, A, TEFz, zp, renorm_t, hess_threshold
+    )
+
+    efmodel = np.zeros_like(fmodel, dtype=fnu_i.dtype)
+    coeffs_draws = np.zeros((ndraws_int, NTEMP), dtype=fnu_i.dtype)
+
+    if ndraws_int <= 0:
+        return chi2, coeffs, fmodel, efmodel, coeffs_draws
+
+    active_mask = coeffs > 0
+    n_active = np.sum(active_mask)
+
+    if n_active > 0 and np.all(np.isfinite(covar)):
+        active_indices = np.where(active_mask)[0]
+        covar_active = np.zeros((n_active, n_active), dtype=covar.dtype)
+        for r_idx, r in enumerate(active_indices):
+            for c_idx, c in enumerate(active_indices):
+                covar_active[r_idx, c_idx] = covar[r, c_idx]
+        
+        active_coeffs = coeffs[active_mask].astype(np.float64)
+        draws = multivariate_normal_numba(active_coeffs, covar_active, ndraws_int)
+        
+        if np.all(np.isfinite(draws)):
+            for i in range(n_active):
+                idx = active_indices[i]
+                coeffs_draws[:, idx] = np.maximum(draws[:, i], 0)
+
+            model_draws = np.dot(coeffs_draws, A)
+            
+            # **FIX:** Manually loop over columns to calculate percentiles
+            n_filt = model_draws.shape[1]
+            p16 = np.zeros(n_filt, dtype=model_draws.dtype)
+            p84 = np.zeros(n_filt, dtype=model_draws.dtype)
+            for i in range(n_filt):
+                p16[i] = np.percentile(model_draws[:, i], 16)
+                p84[i] = np.percentile(model_draws[:, i], 84)
+
+            efmodel = (p84 - p16) / 2.0
+
+    return chi2, coeffs, fmodel, efmodel, coeffs_draws

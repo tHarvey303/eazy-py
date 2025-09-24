@@ -1885,14 +1885,12 @@ class PhotoZ(object):
         skip = np.maximum(len(idx)//par_skip, 1)
         np_check = np.minimum(np_check, skip)
 
+        ndraws_arg = self.NDRAWS if get_err else 0
         if use_numba:
             worker_func = _fit_at_zbest_group_numba
-            ndraws_arg = get_err
         else:
             worker_func = _fit_at_zbest_group
-            ndraws_arg = self.NDRAWS if get_err else 0
         
-        # Tuple of arguments common to all workers
         worker_args_tuple = (self.zp, ndraws_arg, fitter, renorm_t, 
                              hess_threshold, self.tempfilt, self.TEF, 
                              self.ARRAY_DTYPE)
@@ -1902,21 +1900,16 @@ class PhotoZ(object):
             worker_args_serial = (fnu_corr[idx,:], efnu_corr[idx,:], self.zbest[idx]
                                  ) + worker_args_tuple
 
-            res = worker_func(idx, *worker_args_serial, threads=0)
+            _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = worker_func(
+                *((idx,) + worker_args_serial), threads=0
+            )
             
-            if use_numba:
-                _ix, _coeffs, _fmod, _efmod, _chi2 = res
-                self.coeffs_draws.fill(0)
-            else:
-                _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = res
-                if get_err:
-                    self.coeffs_draws[_ix,:,:] = _cdraws
-
             self.coeffs_best[_ix,:] = _coeffs
             self.fmodel[_ix,:] = _fmod
             self.efmodel[_ix,:] = _efmod
             self.chi2_best[_ix] = _chi2
-
+            if get_err:
+                self.coeffs_draws[_ix,:,:] = _cdraws
         else:
             # Multiprocessing
             pool = mp.Pool(processes=np_check)
@@ -1935,26 +1928,21 @@ class PhotoZ(object):
 
             iterator = tqdm(jobs) if HAS_TQDM else jobs
             for res in iterator:
-                result = res.get(timeout=MULTIPROCESSING_TIMEOUT)
-                if use_numba:
-                    _ix, _coeffs, _fmod, _efmod, _chi2 = result
-                    self.coeffs_draws[_ix,:,:] = 0
-                else:
-                    _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = result
-                    if get_err:
-                        self.coeffs_draws[_ix,:,:] = _cdraws
-
+                _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = res.get(timeout=MULTIPROCESSING_TIMEOUT)
+                
                 self.coeffs_best[_ix,:] = _coeffs
                 self.fmodel[_ix,:] = _fmod
                 self.efmodel[_ix,:] = _efmod
                 self.chi2_best[_ix] = _chi2
+                if get_err:
+                    self.coeffs_draws[_ix,:,:] = _cdraws
             
             pool.join()
         
         t1 = time.time()
         print(f'fit_best ({ "numba" if use_numba else "python" }): {t1-t0:.1f} s'
               f' (n_proc={np_check}, NOBJ={subset.sum()})')
-        
+    
     def error_residuals(self, level=1, verbose=True):
         """
         Force error bars to touch the best-fit model
@@ -4206,8 +4194,7 @@ class PhotoZ(object):
         -------
         tab: `astropy.table.Table`
             Table with rest-frame fluxes and population synthesis parameters
-            
-        """   
+        """
         if cosmology is None:
             #from astropy.cosmology import WMAP9 as cosmology
             cosmology = self.cosmology
@@ -4310,14 +4297,12 @@ class PhotoZ(object):
             vnorm_type = 0
         else:
             to_physical = None
-
         if self.get_err:
             par_draws_table = {}
-        
             coeffs_draws = np.maximum(self.coeffs_draws, 0)
             #  Renorm in rest V band
             _draws = np.transpose(coeffs_draws*self.tempfilt.scale, 
-                                  axes=(1,0,2)) 
+                                axes=(1,0,2)) 
             draws_norm = np.transpose(_draws*self.ubvj_tempfilt[iz,:,2],
                                         axes=(0,1,2))
             draws_norm = (draws_norm.T/draws_norm.sum(axis=2).T).T
@@ -4325,15 +4310,15 @@ class PhotoZ(object):
             
             if to_physical is not None:
                 rest_draws = np.transpose((coeffs_draws.T*to_physical).T, 
-                                          axes=(1,0,2))
-                                     
+                                        axes=(1,0,2))                                    
                 # Remove unit (which should be null)
                 rest_draws = np.array(rest_draws)
-                
+                rest_draws[~np.isfinite(rest_draws)] = 0.
         else:
             draws_norm = None
             coeffs_draws = None
-        
+
+
         ##### Redshift-dependent templates / parameters
         iz0 = np.zeros(self.NOBJ, dtype=int)
         zb = self.zbest*1
@@ -7094,9 +7079,9 @@ def _fit_rest_group_numba(ix, fnu_corr, efnu_corr, izbest, zbest, zp, renorm_t, 
         
     return ix, f_rest
 
-def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, get_err,
+def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, ndraws,
                              fitter, renorm_t, hess_threshold,
-                             tempfilt, TEF, ARRAY_DTYPE, threads):
+                             tempfilt, TEF, ARRAY_DTYPE, threads=0):
     """
     Multiprocessing worker for numba-based fit_at_zbest.
     """
@@ -7112,6 +7097,9 @@ def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, get_err,
     efmodel = np.zeros((NOBJ, NFILT), dtype=ARRAY_DTYPE)
     chi2_best = np.zeros(NOBJ, dtype=ARRAY_DTYPE)
     
+    NDRAWS = int(ndraws)
+    coeffs_draws = np.zeros((NOBJ, NDRAWS, NTEMP), dtype=ARRAY_DTYPE)
+    
     for iobj in range(NOBJ):
         z = zbest[iobj]
         if (z < tempfilt.zgrid[0]) or (z > tempfilt.zgrid[-1]) or not np.isfinite(z):
@@ -7120,8 +7108,8 @@ def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, get_err,
         A = tempfilt(z)
         TEFz = TEF(z)
         
-        chi2, coeffs, fmod, efmod = _single_object_fit_at_zbest_numba(
-            fnu_corr[iobj,:], efnu_corr[iobj,:], A, TEFz, zp, get_err,
+        chi2, coeffs, fmod, efmod, cdraws = _single_object_fit_at_zbest_numba(
+            fnu_corr[iobj,:], efnu_corr[iobj,:], A, TEFz, zp, NDRAWS,
             renorm_t, hess_threshold
         )
         
@@ -7129,5 +7117,7 @@ def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, get_err,
         fmodel[iobj,:] = fmod
         efmodel[iobj,:] = efmod
         chi2_best[iobj] = chi2
-        
-    return ix, coeffs_best, fmodel, efmodel, chi2_best
+        if NDRAWS > 0:
+            coeffs_draws[iobj,:,:] = cdraws
+            
+    return ix, coeffs_best, fmodel, efmodel, chi2_best, coeffs_draws

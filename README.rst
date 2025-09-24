@@ -13,6 +13,7 @@ eazy-py: Pythonic photometric redshift tools based on EAZY
 
 Forked by T. Harvey, converted to optionally use Numba JIT compiled functions and a reimplementation of the Scipy NNLS solver in pure Numpy functions,
 which provides an approx ~10x speedup over the base code. Enable with ```use_numba``` argument. 
+
 .. image:: https://github.com/tHarvey303/eazy-py/blob/master/scripts/performance.png
 
 Documentation will be here: https://eazy-py.readthedocs.io/, though it's essentially just the module API for now.

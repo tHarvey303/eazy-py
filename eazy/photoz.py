@@ -1816,7 +1816,7 @@ class PhotoZ(object):
         self.ZML_WITH_BETA_PRIOR = beta_prior
 
 
-    def fit_at_zbest(self, zbest=None, prior=False, beta_prior=False, get_err=False, clip_wavelength=1100, selection=None,  n_proc=0, par_skip=10000, recompute_zml=True, **kwargs):
+    def fit_at_zbest(self, zbest=None, prior=False, beta_prior=False, get_err=False, clip_wavelength=1100, selection=None,  n_proc=0, par_skip=10000, recompute_zml=True, use_numba=True, **kwargs):
         """
         Recompute the fit coefficients at the "best" redshift.  
         
@@ -1825,38 +1825,34 @@ class PhotoZ(object):
         
         """
         import multiprocessing as mp
+        from tqdm import tqdm
         
         fitter = self.param['FITTER']
         renorm_t = self.param['RENORM_TEMPLATES'] in utils.TRUE_VALUES
         hess_threshold = self.param['HESS_THRESHOLD']
 
-        #izbest = np.argmin(self.chi2_fit, axis=1)
         izbest = self.izbest*1
-        has_chi2 = (self.chi2_fit != 0).sum(axis=1) > 0 
         
         self.get_err = get_err
         
         self.zbest_grid = self.zgrid[izbest]
-        #self.chi_best
         
         if zbest is None:
             if (self.zml is None):
                 recompute_zml |= True
             else:
-                # Recompute if prior options changed
                 recompute_zml |= prior is not self.ZML_WITH_PRIOR
                 recompute_zml |= beta_prior is not self.ZML_WITH_BETA_PRIOR
                 
             if recompute_zml:
                 self.evaluate_zml(prior=prior, beta_prior=beta_prior)
 
-            self.ZPHOT_USER = False # user did *not* specify zbest
+            self.ZPHOT_USER = False
             self.zbest = self.zml
-                            
         else:
             self.zbest = zbest
-            self.ZPHOT_USER = True # user *did* specify zbest
-                    
+            self.ZPHOT_USER = True
+            
         if ((self.param['FIX_ZSPEC'] in utils.TRUE_VALUES) & 
             ('z_spec' in self.cat.colnames)):
             has_zsp = self.ZSPEC > self.zgrid[0]
@@ -1865,7 +1861,6 @@ class PhotoZ(object):
         else:
             self.ZPHOT_AT_ZSPEC = False
             
-        # Compute Risk function at z=zbest
         self.zbest_risk = self.compute_best_risk()
         
         fnu_corr = self.fnu*self.ext_redden*self.zp
@@ -1878,91 +1873,88 @@ class PhotoZ(object):
             
         idx = self.idx[subset]
         
-        # Set seed
         np.random.seed(self.random_seed)
         
         if n_proc <= 0:
-            np_check = np.maximum(mp.cpu_count() - 2, 1)
+            np_check = 1
         else:
             np_check = np.minimum(mp.cpu_count(), n_proc)
-            
-        # Fit in parallel mode        
+        
         t0 = time.time()
         
         skip = np.maximum(len(idx)//par_skip, 1)
         np_check = np.minimum(np_check, skip)
-        
-        if get_err:
-            get_err = self.NDRAWS
-            
-        if skip == 1:
-            # Serial (pass self at end to update arrays in place)
-            _ = _fit_at_zbest_group(
-                idx, 
-                fnu_corr[idx,:],
-                efnu_corr[idx,:],
-                self.zbest[idx],
-                self.zp*1,
-                get_err,
-                fitter,
-                renorm_t,
-                hess_threshold,
-                self.tempfilt,
-                self.TEF,
-                self.ARRAY_DTYPE,
-                None
-            )
 
-            _ix, _coeffs_best, _fmodel, _efmodel, _chi2_best, _cdraws = _
-            self.coeffs_best[_ix,:] = _coeffs_best
-            self.fmodel[_ix,:] = _fmodel
-            self.efmodel[_ix,:] = _efmodel
-            self.chi2_best[_ix] = _chi2_best
-            if get_err:
-                self.coeffs_draws[_ix,:,:] = _cdraws
+        if use_numba:
+            worker_func = _fit_at_zbest_group_numba
+            ndraws_arg = get_err
+        else:
+            worker_func = _fit_at_zbest_group
+            ndraws_arg = self.NDRAWS if get_err else 0
+        
+        # Tuple of arguments common to all workers
+        worker_args_tuple = (self.zp, ndraws_arg, fitter, renorm_t, 
+                             hess_threshold, self.tempfilt, self.TEF, 
+                             self.ARRAY_DTYPE)
+        
+        if skip == 1:
+            # Serial execution
+            worker_args_serial = (fnu_corr[idx,:], efnu_corr[idx,:], self.zbest[idx]
+                                 ) + worker_args_tuple
+
+            res = worker_func(idx, *worker_args_serial, threads=0)
             
+            if use_numba:
+                _ix, _coeffs, _fmod, _efmod, _chi2 = res
+                self.coeffs_draws.fill(0)
+            else:
+                _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = res
+                if get_err:
+                    self.coeffs_draws[_ix,:,:] = _cdraws
+
+            self.coeffs_best[_ix,:] = _coeffs
+            self.fmodel[_ix,:] = _fmod
+            self.efmodel[_ix,:] = _efmod
+            self.chi2_best[_ix] = _chi2
+
         else:
             # Multiprocessing
             pool = mp.Pool(processes=np_check)
             jobs = [
                 pool.apply_async(
-                    _fit_at_zbest_group, (
-                        idx[i::skip], 
-                        fnu_corr[idx[i::skip],:], 
-                        efnu_corr[idx[i::skip],:], 
-                        self.zbest[idx[i::skip]], 
-                        self.zp*1,
-                        get_err, 
-                        fitter,
-                        renorm_t,
-                        hess_threshold,
-                        self.tempfilt,
-                        self.TEF,
-                        self.ARRAY_DTYPE,
-                        None
-                    )
+                    worker_func,
+                    args=((idx[i::skip],
+                           fnu_corr[idx[i::skip],:], efnu_corr[idx[i::skip],:],
+                           self.zbest[idx[i::skip]])
+                           + worker_args_tuple),
+                    kwds={'threads': skip}
                 ) 
                 for i in range(skip)
             ]
-
             pool.close()
-            pool.join()
 
-            for res in jobs:
-                _ = res.get(timeout=MULTIPROCESSING_TIMEOUT)
-                _ix, _coeffs_best, _fmodel, _efmodel, _chi2_best, _cdraws = _
-                self.coeffs_best[_ix,:] = _coeffs_best
-                self.fmodel[_ix,:] = _fmodel
-                self.efmodel[_ix,:] = _efmodel
-                self.chi2_best[_ix] = _chi2_best
-                if get_err:
-                    self.coeffs_draws[_ix,:,:] = _cdraws
+            iterator = tqdm(jobs) if HAS_TQDM else jobs
+            for res in iterator:
+                result = res.get(timeout=MULTIPROCESSING_TIMEOUT)
+                if use_numba:
+                    _ix, _coeffs, _fmod, _efmod, _chi2 = result
+                    self.coeffs_draws[_ix,:,:] = 0
+                else:
+                    _ix, _coeffs, _fmod, _efmod, _chi2, _cdraws = result
+                    if get_err:
+                        self.coeffs_draws[_ix,:,:] = _cdraws
+
+                self.coeffs_best[_ix,:] = _coeffs
+                self.fmodel[_ix,:] = _fmod
+                self.efmodel[_ix,:] = _efmod
+                self.chi2_best[_ix] = _chi2
+            
+            pool.join()
         
         t1 = time.time()
-        print(f'fit_best: {t1-t0:.1f} s (n_proc={np_check}, '
-              f' NOBJ={subset.sum()})')
-
-
+        print(f'fit_best ({ "numba" if use_numba else "python" }): {t1-t0:.1f} s'
+              f' (n_proc={np_check}, NOBJ={subset.sum()})')
+        
     def error_residuals(self, level=1, verbose=True):
         """
         Force error bars to touch the best-fit model
@@ -4086,7 +4078,7 @@ class PhotoZ(object):
         return peaks, numpeaks
 
 
-    def abs_mag(self, f_numbers=[271, 272, 274], cosmology=None, rest_kwargs={'percentiles':[2.5,16,50,84,97.5], 'pad_width':0.5, 'max_err':0.5, 'verbose':False, 'simple':False}):
+    def abs_mag(self, f_numbers=[271, 272, 274], cosmology=None, rest_kwargs={'percentiles':[2.5,16,50,84,97.5], 'pad_width':0.5, 'max_err':0.5, 'verbose':False, 'simple':False}, use_numba=True):
         """
         Get absolute mags (e.g., M_UV tophat filters).
         
@@ -4113,7 +4105,7 @@ class PhotoZ(object):
             #from astropy.cosmology import WMAP9 as cosmology
             cosmology = self.cosmology
             
-        _rf = self.rest_frame_fluxes(f_numbers=f_numbers, **rest_kwargs) 
+        _rf = self.rest_frame_fluxes(f_numbers=f_numbers, use_numba=use_numba, **rest_kwargs) 
         rf_tf, rf_lc, rf = _rf
         
         zdm = self.zgrid #utils.log_zgrid([0.01, 13], 0.01)
@@ -4138,8 +4130,7 @@ class PhotoZ(object):
         
         return tab
 
-
-    def sps_parameters(self, UBVJ=DEFAULT_UBVJ_FILTERS, extra_rf_filters=DEFAULT_RF_FILTERS, cosmology=None, simple=False, rf_pad_width=0.5, rf_max_err=0.5, percentile_limits=[2.5, 16, 50, 84, 97.5], template_fnu_units=(1*u.solLum / u.Hz), vnorm_type=2, n_proc=-1, coeffv_min=0, **kwargs):
+    def sps_parameters(self, UBVJ=DEFAULT_UBVJ_FILTERS, extra_rf_filters=DEFAULT_RF_FILTERS, cosmology=None, simple=False, rf_pad_width=0.5, rf_max_err=0.5, percentile_limits=[2.5, 16, 50, 84, 97.5], template_fnu_units=(1*u.solLum / u.Hz), vnorm_type=2, n_proc=-1, coeffv_min=0, use_numba=True, **kwargs):
         """
         Rest-frame colors and population parameters at redshift in ``self.zbest`` attribute
         
@@ -4230,7 +4221,7 @@ class PhotoZ(object):
                                        max_err=rf_max_err, 
                                        percentiles=[2.5,16,50,84,97.5], 
                                        verbose=False, simple=simple, 
-                                       n_proc=n_proc, **kwargs)
+                                       n_proc=n_proc, use_numba=use_numba, **kwargs)
          
         self.ubvj_tempfilt, self.ubvj_lc, self.ubvj = _ubvj
         self.ubvj_f_numbers = UBVJ
@@ -4737,7 +4728,8 @@ class PhotoZ(object):
                                          percentiles=[16,50,84], 
                                          verbose=False,
                                          n_proc=n_proc,
-                                         simple=simple) 
+                                         simple=simple,
+                                        use_numba=use_numba)
             
             extra_tempfilt, extra_lc, extra_rest = _ex
             
@@ -4763,8 +4755,563 @@ class PhotoZ(object):
         
         return tab
 
+    def sps_parameters_mod(self, UBVJ=DEFAULT_UBVJ_FILTERS, extra_rf_filters=DEFAULT_RF_FILTERS, cosmology=None, simple=False, rf_pad_width=0.5, rf_max_err=0.5, percentile_limits=[2.5, 16, 50, 84, 97.5], template_fnu_units=(1*u.solLum / u.Hz), vnorm_type=2, n_proc=-1, coeffv_min=0, **kwargs):
+        """
+        Rest-frame colors and population parameters at redshift in ``self.zbest`` attribute
+        
+        Parameters
+        ----------
+        UBVJ : (int, int, int, int)
+            Filter indices of U, B, V, J filters in `params['FILTER_FILE']`.
+        
+        extra_rf_filters : list
+            If specified, additional filters to calculate rest-frame fluxes
+        
+        LIR_wave : (min_wave, max_wave)
+            Limits in microns to integrate the far-IR SED to calculate LIR.
+            (**removed to always use tabulated in ``param.fits`` file**)
+            
+        cosmology : `astropy.cosmology`
+            Cosmology for calculating luminosity distances, etc.  Defaults to
+            flat cosmology with H0, OMEGA_M, OMEGA_L from the parameter file.
 
-    def standard_output(self, zbest=None, prior=False, beta_prior=False, UBVJ=DEFAULT_UBVJ_FILTERS, extra_rf_filters=DEFAULT_RF_FILTERS, cosmology=None, simple=False, rf_pad_width=0.5, rf_max_err=0.5, save_fits=True, get_err=True, percentile_limits=[2.5, 16, 50, 84, 97.5], n_proc=0, clip_wavelength=1100, absmag_filters=[271, 272, 274], run_find_peaks=False, **kwargs):#
+        simple, rf_pad_width, rf_max_err : bool, float, float
+            See `~eazy.photoz.PhotoZ.rest_frame_fluxes`.
+                
+        template_fnu_units : `astropy.units.Unit`, None
+            Units of templates when converted to ``flux_fnu``, e.g., 
+            :math:`L_\odot / Hz` for FSPS templates.  If ``None``, then 
+            parameters are computed normalizing fits to the V band based on 
+            `vnorm_type`.
+        
+        vnorm_type : 1 or 2
+            V-band normalization type for the tabulated parameters, if
+            ``template_fnu_units = None``. The fit coefficients are first
+            normalized to the template V-band, i.e., such that they give each
+            template's contribution to the observed rest-frame V-band. Then
+            the population parameters are estimated with these coefficients as
+            follows.
+            
+            `vnorm_type = 1`
+            
+               - `coeffs_norm`: coefficients renormalized to template
+                 rest-frame V-band
+               - `tab`: table of parameters associated with the templates
+               - `Lv`: V-band luminosity derived from the rest-frame V flux 
+                 inferred from the photometry
+               
+                   >>> Lv_norm = (coeffs_norm * tab['Lv']).sum()
+                   >>> mass_norm = (coeffs_norm * tab['mass']).sum()
+                   >>> mass = (mass_norm / Lv_norm) * Lv
+
+            `vnorm_type = 2`
+
+               - `coeffs_norm`: coefficients renormalized to template 
+                 rest-frame V-band
+               - `tab`: table of parameters associated with the templates
+               - `Lv`: V-band luminosity derived from the rest-frame V flux 
+                 inferred from the photometry
+               
+                   >>> mass_norm = (coeffs_norm * tab['mass'] / tab['Lv']).sum()
+                   >>> mass = (mass_norm / Lv_norm) * Lv
+            
+            The latter, ``vnorm_type = 2``, is the conceptually preferred 
+            method, though the former should be used with the `fsps_QSF_12_v3.param <https://github.com/gbrammer/eazy-photoz/blob/master/templates/fsps_full/fsps_QSF_12_v3.param>`_ template set.
+        
+        coeffv_min : float
+            Mininum contribution to the observed v-band flux that contributes
+            to the parameter estimates.  Set to a small positive number to 
+            limit the contribution of extreme (dusty) M/Lv SFR/Lv templates
+            to the derived parameters.
+            
+        n_proc : int
+            Number of parrallel processes 
+        
+        Returns
+        -------
+        tab: `astropy.table.Table`
+            Table with rest-frame fluxes and population synthesis parameters
+            
+        """   
+        from astropy.table import Table
+        import astropy.units as u
+        from astropy.constants import c as const_c
+        
+        if cosmology is None:
+            cosmology = self.cosmology
+        
+        # FIX 1: Check if simple=True is possible, otherwise fall back to re-fitting.
+        # This is necessary because the Numba fit path doesn't generate coeffs_draws.
+        can_run_simple = simple and self.get_err and hasattr(self, 'coeffs_draws') and np.any(self.coeffs_draws != 0)
+        simple_for_rf = simple
+        if simple and not can_run_simple:
+            warnings.warn(
+                "`simple=True` requires `get_err=True` and a non-Numba `fit_at_zbest` "
+                "run to generate coefficient draws. Falling back to `simple=False`.",
+                AstropyUserWarning
+            )
+            simple_for_rf = False
+            
+        _ubvj = self.rest_frame_fluxes(f_numbers=UBVJ, pad_width=rf_pad_width, 
+                                       max_err=rf_max_err, 
+                                       percentiles=percentile_limits, 
+                                       verbose=False, simple=simple_for_rf, 
+                                       n_proc=n_proc, **kwargs)
+        
+        self.ubvj_tempfilt, self.ubvj_lc, self.ubvj = _ubvj
+        self.ubvj_f_numbers = UBVJ
+        
+        restU = self.ubvj[:,0,2]
+        restB = self.ubvj[:,1,2]
+        restV = self.ubvj[:,2,2]
+        restJ = self.ubvj[:,3,2]
+
+        errU = (self.ubvj[:,0,3] - self.ubvj[:,0,1])/2.
+        errB = (self.ubvj[:,1,3] - self.ubvj[:,1,1])/2.
+        errV = (self.ubvj[:,2,3] - self.ubvj[:,2,1])/2.
+        errJ = (self.ubvj[:,3,3] - self.ubvj[:,3,1])/2.
+                    
+        has_template_params = False
+        try_paths = ['./', utils.DATA_PATH]
+        for path in try_paths:
+            template_params_file = os.path.join(path, self.param['TEMPLATES_FILE']+'.fits')
+            if os.path.exists(template_params_file):
+                has_template_params = True
+                break
+        
+        if has_template_params:
+            tab_temp = Table.read(template_params_file)
+            if len(tab_temp) != self.NTEMP:
+                NADD = self.NTEMP - len(tab_temp)
+                msg = 'Warning: adding {0} empty rows to {1} to match NTEMP={2}'
+                print(msg.format(NADD, template_params_file, self.NTEMP))
+                for j in range(NADD):
+                    tab_temp.add_row(vals=None)
+        else:
+            msg = f"""
+Couldn't find template parameters file {self.param['TEMPLATES_FILE']}.fits in {try_paths} for population synthesis 
+calculations.
+            """
+            print(msg)
+            tab_temp = Table()
+            # Create dummy table
+            cols = ['Av', 'mass', 'Lv', 'sfr', 'LIR']
+            for c in cols:
+                tab_temp[c] = np.ones(self.NTEMP)*np.nan
+        
+        iz = self.izbest
+        coeffs_norm = self.coeffs_best * self.tempfilt.scale
+        coeffs_norm *= self.ubvj_tempfilt[iz,:,2]
+        
+        # FIX 2: Safeguard against division by zero if coeffs sum to zero
+        coeffs_sum = coeffs_norm.sum(axis=1)
+        good_sum = coeffs_sum != 0
+        coeffs_norm[good_sum,:] = (coeffs_norm[good_sum,:].T/coeffs_sum[good_sum]).T
+        
+        if coeffv_min > 0:
+            coeffs_norm[coeffs_norm < coeffv_min] = 0
+            
+        fnu_units = u.erg/u.s/u.cm**2/u.Hz
+        uJy_to_cgs = u.microJansky.to(u.erg/u.s/u.cm**2/u.Hz)
+        fnu_scl = 10**(-0.4*(self.param.params['PRIOR_ABZP']-23.9))*uJy_to_cgs
+        
+        dL = np.zeros(self.NOBJ, dtype=np.float64)*u.cm
+        mask = self.zbest > 0
+        dL[mask] = cosmology.luminosity_distance(self.zbest[mask]).to(u.cm)
+        
+        par_table = {}
+        
+        if template_fnu_units is not None:
+             to_physical = fnu_scl*fnu_units*4*np.pi*dL**2/(1+self.zbest)
+             to_physical /= (1*template_fnu_units).to(u.erg/u.second/u.Hz)
+             vnorm_type = 0
+        else:
+            to_physical = None
+
+        if self.get_err:
+            par_draws_table = {}
+            coeffs_draws = np.maximum(self.coeffs_draws, 0)
+            _draws = np.transpose(coeffs_draws*self.tempfilt.scale, axes=(1,0,2))
+            draws_norm = np.transpose(_draws*self.ubvj_tempfilt[iz,:,2], axes=(0,1,2))
+            
+            draws_sum = draws_norm.sum(axis=2)
+            good_draws_sum = draws_sum != 0
+            draws_norm[good_draws_sum] = (draws_norm[good_draws_sum].T / draws_sum[good_draws_sum]).T
+            
+            if to_physical is not None:
+                rest_draws = np.transpose((coeffs_draws.T*to_physical).T, axes=(1,0,2))
+                rest_draws = np.array(rest_draws)
+        
+        temp_par_zdep = {}
+        for par in ['mass', 'sfr', 'Lv', 'LIR', 'energy_abs', 'Av', 'lw_Age_V']:
+            if par not in tab_temp.colnames:
+                continue
+            
+            temp_par = tab_temp[par]
+            if temp_par.ndim == 1:
+                temp_par_zdep[par] = temp_par
+            else:
+                # Redshift-dependent parameters
+                temp_matrix = np.zeros_like(self.coeffs_best)
+                zb = self.zbest*1
+                zb[~np.isfinite(zb)] = -1.
+                
+                for _i, templ in enumerate(self.templates):
+                    if templ.NZ == 0:
+                        iz = iz0
+                        temp_matrix[:, _i] = temp_par[_i, iz]
+                    elif TEMPLATE_REDSHIFT_TYPE == 'interp':
+                        par_int = np.interp(zb, templ.redshifts,
+                                            temp_par[_i, :])
+                        temp_matrix[:, _i] = par_int
+                    else:
+                        iz = templ.zindex(zb)
+                        temp_matrix[:, _i] = temp_par[_i, iz]
+                
+                temp_par_zdep[par] = temp_matrix        
+                              
+        ##### Use physical units
+        if to_physical is not None:
+            
+            if self.param['VERBOSITY'] >= 2:
+                print(f' ... Physical quantities directly from coeffs and'+ 
+                      f' templates ({template_fnu_units})')
+            
+            # Coefficients with units
+            coeffs_rest = (self.coeffs_best.T*to_physical).T
+            # Remove unit (which should be null)
+            coeffs_rest = np.array(coeffs_rest)*self.tempfilt.scale
+            if coeffv_min > 0:
+                coeffs_rest[~coeffs_include] = 0
+            
+            table_units = {'mass':u.solMass, 'sfr':u.solMass/u.yr,
+                           'Lv':u.solLum, 'LIR':u.solLum, 
+                           'energy_abs':u.solLum, 
+                           'Lu':u.solLum, 'Lj':u.solLum, 
+                           'L1400':u.solLum, 'L2800':u.solLum, 
+                           'lwAgeV':u.Gyr, 'lw_age_V':u.Gyr,
+                           'lwAgeR':u.Gyr, 'lw_age_R':u.Gyr,
+                           'LHa':u.solLum, 'LOIII':u.solLum, 
+                           'LHb':u.solLum, 'LOII':u.solLum}
+                        
+            for par in ['mass', 'sfr', 'Lv', 'LIR', 'energy_abs', 
+                        'Lu', 'Lj', 'L1400', 'L2800', 
+                        'LHa', 'LOIII', 'LHb', 'LOII']:
+                
+                if par not in temp_par_zdep:
+                    #par_table[par] = np.zeros(self.NOBJ) - 99.
+                    continue
+                    
+                temp_par = temp_par_zdep[par]
+                par_value = (coeffs_rest*temp_par).sum(axis=1)
+                if self.get_err:
+                    par_draws = (rest_draws*temp_par).sum(axis=2)
+                                
+                par_table[par] = par_value
+                if par in table_units:
+                    par_table[par] *= table_units[par]
+                elif hasattr(tab_temp[par], 'unit'):
+                    if tab_temp[par].unit is not None:
+                        par_table[par] *= tab_temp[par].unit
+                
+                if self.get_err:
+                    par_draws_table[par] = par_draws
+                    
+            par_table['MLv'] = par_table['mass']/par_table['Lv']
+            
+            # Light-weighted (V) parameters
+            for par in ['Av', 'dust1', 'dust2', 'lwAgeV', 'lw_Age_V']:
+                
+                if par not in temp_par_zdep:
+                    continue
+                
+                if par in ['Av', 'dust1', 'dust2']:
+                    # Dust calculated as tau = Sum(tau*coeff) / Sum(1*coeff)
+                    if par == 'Av':
+                        Av_tau = 0.4*np.log(10)
+                    else:
+                        Av_tau = 1.
+                        
+                    temp_par = np.exp(temp_par_zdep[par]*Av_tau)
+                    is_dust = True
+                else:
+                    is_dust = False
+                    temp_par = temp_par_zdep[par]
+                                
+                par_value = (coeffs_norm*temp_par).sum(axis=1)
+                if is_dust:
+                    temp_ones = np.ones_like(temp_par)
+                    par_denom = (coeffs_norm*temp_ones).sum(axis=1)
+                    par_value = np.log(par_value/par_denom) / Av_tau
+                        
+                par_table[par] = par_value
+                if par in table_units:
+                    par_table[par] *= table_units[par]
+                
+                if self.get_err & is_dust:
+                    
+                    # Light-weighted params
+                    tau_num = (draws_norm*temp_par).sum(axis=2)
+                    tau_den = (draws_norm*(temp_par*0+1)).sum(axis=2)
+                    tau_dust = np.log(tau_num/tau_den) / Av_tau
+                    par_draws_table[par] = tau_dust
+
+                    del(tau_num)
+                    del(tau_den)
+                    del(tau_dust)
+                    
+            if self.get_err:
+                del(rest_draws)
+        else:
+            # Path for templates without physical units, relying on V-band normalization
+            if vnorm_type == 1:
+                Lv_norm = (coeffs_norm*temp_par_zdep['Lv']).sum(axis=1) * u.solLum
+                vdenom = 1.
+            else:
+                Lv_norm = 1.*u.solLum
+                vdenom = temp_par_zdep['Lv']
+
+            Mv = (coeffs_norm*temp_par_zdep['mass']/vdenom).sum(axis=1) * u.solMass * (1./Lv_norm)
+            LIRv = (coeffs_norm*temp_par_zdep['LIR']/vdenom).sum(axis=1) * u.solLum * (1./Lv_norm)
+            SFRv = (coeffs_norm*temp_par_zdep['sfr']/vdenom).sum(axis=1) * u.solMass / u.yr * (1./Lv_norm)
+            
+            if 'energy_abs' in temp_par_zdep:
+                energy_abs_v = (coeffs_norm * temp_par_zdep['energy_abs']/vdenom).sum(axis=1) * u.solLum * (1./Lv_norm)
+            else:
+                energy_abs_v = LIRv * 0.
+
+            # Compute Lv from the rest-frame V flux
+            fnu = restV * fnu_scl * fnu_units
+            Lnu = fnu * 4 * np.pi * dL**2
+            
+            # **FIX 3:** Use rest-frame pivot wavelength for frequency conversion
+            pivotV_rest = self.ubvj_lc[2] * u.Angstrom
+            nuV_rest = (const_c / pivotV_rest).to(u.Hz)
+            Lv = (nuV_rest * Lnu).to(u.L_sun)
+            
+            # V-band light-weighted Av
+            Av_tau = 0.4*np.log(10)
+            tau_corr = np.exp(temp_par_zdep.get('Av', 0) * Av_tau)
+            tau_num = (coeffs_norm * tau_corr).sum(axis=1)
+            tau_den = (coeffs_norm * (tau_corr * 0 + 1)).sum(axis=1)
+            tau_dust = np.log(tau_num / tau_den)
+            Av = tau_dust / Av_tau
+            
+            # V-band light-weighted age
+            lw_age_V = -99 * u.Gyr
+            if 'lw_Age_V' in temp_par_zdep:
+                lw_age_V = (coeffs_norm * temp_par_zdep['lw_Age_V']).sum(axis=1) * u.Gyr
+            
+            par_table['Lv'] = Lv
+            par_table['mass'] = Mv * Lv
+            par_table['sfr'] = SFRv * Lv
+            par_table['LIR'] = LIRv * Lv
+            par_table['energy_abs'] = energy_abs_v * Lv
+            par_table['Av'] = Av
+            par_table['lw_age_V'] = lw_age_V
+            par_table['MLv'] = Mv
+            
+        # Make the full table
+        tab = Table()
+        
+        tab['restU'] = restU
+        tab['restU_err'] = errU
+        tab['restB'] = restB
+        tab['restB_err'] = errB
+        tab['restV'] = restV
+        tab['restV_err'] = errV
+        tab['restJ'] = restJ
+        tab['restJ_err'] = errJ
+
+        tab['dL'] = dL.to(u.Mpc)
+
+        column_formats = {'dL':'.1e',
+                         'mass':'.2e',
+                         'sfr': '.3f',
+                         'Lv':  '.2e',
+                         'LIR': '.2e',
+                         'energy_abs':  '.2e',
+                         'Lu': '.2e',
+                         'Lj': '.2e',
+                         'L1400': '.2e',
+                         'L2800': '.2e',
+                         'lw_age_V':'.2f',
+                         'lwAgeV':'.2f',
+                         'MLv':'.2f',
+                         'Av':'.2f',
+                         'ssfr':'.2e',
+                         'LHa':'.2e',
+                         'LOIII':'.2e',
+                         'LHb':'.2e',
+                         'LOII':'.2e'}
+
+        for col in par_table:
+            tab[col] = par_table[col]
+        
+        for col in tab.colnames:
+            if col in column_formats:
+                tab[col].format = column_formats[col]
+            else:
+                tab[col].format = '.3f'
+        
+        # Add percentile columns from coefficient draws
+        if self.get_err:
+            # Propagate coeff covariance to parameters
+            if self.param['VERBOSITY'] >= 2:
+                print(' ... Get uncertainties')
+            
+            if to_physical is None:
+        
+                if vnorm_type == 1:
+                    # For use with fsps_QSF_12 templates            
+                    # Why is this required????
+                    Lv_draws = (draws_norm*temp_par_zdep['Lv']).sum(axis=2)
+                    Lv_draws *= u.solLum
+                    vdenom = 1.
+                else:
+                    # The "correct" way, parameters have to be normalized
+                    # to V-band, also
+                    arr = (draws_norm*temp_par_zdep['Lv']).sum(axis=2)
+                    Lv_draws = np.ones_like(arr)*u.solLum
+                    vdenom = temp_par_zdep['Lv']
+        
+                massv_draws = (draws_norm*temp_par_zdep['mass']/vdenom).sum(axis=2)
+                massv_draws *= u.solMass
+
+                SFR_draws = (draws_norm*temp_par_zdep['sfr']/vdenom).sum(axis=2)
+                SFR_draws *= u.solMass/u.yr
+
+                LIR_draws = (draws_norm*temp_par_zdep['LIR']/vdenom).sum(axis=2)
+                LIR_draws *= u.solLum
+                                
+                par_draws_table['Lv'] = Lv_draws
+                par_draws_table['mass'] = (massv_draws / Lv_draws)*Lv
+                par_draws_table['LIR'] = (LIR_draws / Lv_draws)*Lv
+                par_draws_table['sfr'] = (SFR_draws / Lv_draws)*Lv
+                
+                # Light-weighted params
+                tau_num = (draws_norm*tau_corr).sum(axis=2)
+                tau_den = (draws_norm*(tau_corr*0+1)).sum(axis=2)
+                tau_dust = np.log(tau_num/tau_den) / Av_tau
+                par_draws_table['Av'] = tau_dust
+                
+                del(tau_num)
+                del(tau_den)
+                del(tau_dust)
+                
+            else:
+                # Computed earlier with units
+                pass
+                    
+            par_draws_table['ssfr'] = (par_draws_table['sfr'] / 
+                                       par_draws_table['mass'])
+                                                   
+            for col in par_draws_table:
+                pcol = col+'_p'
+                #print('xxx', col, par_draws_table[col].shape)
+                tab[pcol] = np.percentile(par_draws_table[col],
+                                          percentile_limits, axis=0).T
+                
+                if col in column_formats:
+                    tab[pcol].format = column_formats[col]
+                else:
+                    tab[pcol].format = '.3f'
+        
+        if 'sfr' in tab.colnames:
+            tab['sfr'].description = 'SFR over last 100 Myr'
+        
+        if 'LIR' in tab.colnames:
+            tab['LIR'].description = 'IR luminosity = energy_abs'
+
+        for c in ['lw_Age_V', 'lwAgeV', 'AgeV']:
+            if c in tab.colnames:
+                tab[c].description = 'Light-weighted age (V band)'
+
+        for col in tab.colnames:
+            bad = ~np.isfinite(tab[col])
+            tab[col][bad] = -9e29
+        
+        for k in [
+            'SYS_ERR',
+            'TEMP_ERR_FILE',
+            'TEMP_ERR_A2',
+            'PRIOR_FILTER',
+            'PRIOR_ABZP',
+            'IGM_SCALE_TAU',
+            'APPLY_IGM',
+            'TEMPLATES_FILE',
+            'RENORM_TEMPLATES',
+            'HESS_THRESHOLD',
+        ]:
+            if k in self.param.params:
+                tab.meta[k] = self.param[k]
+        
+        for i, templ in enumerate(self.templates):
+            tab.meta[f'TEMPL{i:03d}'] = templ.name
+            
+        tab.meta['ZBEST_USER'] = self.ZPHOT_USER
+        tab.meta['ZBEST_AT_ZSPEC'] = self.ZPHOT_AT_ZSPEC
+        tab.meta['ZML_WITH_PRIOR'] = self.ZML_WITH_PRIOR
+        tab.meta['ZML_WITH_BETA_PRIOR'] = self.ZML_WITH_BETA_PRIOR
+        tab.meta['RFSIMPLE'] = simple, 'RF fluxes without reweighting'
+        tab.meta['COEFFVM'] = coeffv_min, 'Threshold template contribution to rest-V'
+        tab.meta['VNORMTYP'] = vnorm_type, 'Vnorm method (0=units)'
+        
+        for i in range(self.NFILT):
+            f_i = self.f_numbers[i]
+            c_i = self.flux_columns[i]
+            
+            comment = 'ZP offset in filter {0} ({1})'.format(f_i, c_i)
+            tab.meta['ZP{0}'.format(f_i)] = self.zp[i], comment
+            
+        tab.meta['FNUSCALE'] = (fnu_scl, 'Scale factor to f-nu CGS')
+        tab.meta['COSMOL'] = (cosmology.name, 'Cosmological model')
+        tab.meta['COS_OM'] = (cosmology.Om0, 'Omega matter')
+        tab.meta['COS_OL'] = (cosmology.Ode0, 'Omega lambda')
+        tab.meta['COS_H0'] = (cosmology.H0.value, 'Hubble constant')
+        
+        tab.meta['RF_PADW'] = (rf_pad_width, 'pad_width for RF fluxes')
+        tab.meta['RF_PADM'] = (rf_max_err, 'max_err for RF fluxes')
+                                       
+        # Additional Rest-frame filters
+        if len(extra_rf_filters) > 0:
+            _ex = self.rest_frame_fluxes(f_numbers=extra_rf_filters,
+                                         pad_width=rf_pad_width, 
+                                         max_err=rf_max_err, 
+                                         percentiles=[16,50,84], 
+                                         verbose=False,
+                                         n_proc=n_proc,
+                                         simple=simple) 
+            
+            extra_tempfilt, extra_lc, extra_rest = _ex
+            
+            for ir, f_n in enumerate(extra_rf_filters):
+                tab['rest{0}'.format(f_n)] = extra_rest[:,ir,1]
+                tab['rest{0}'.format(f_n)].format = '.3f'
+                
+                rwidth = (extra_rest[:,ir,2]-extra_rest[:,ir,0])/2.
+                tab['rest{0}_err'.format(f_n)] = rwidth                
+                tab['rest{0}_err'.format(f_n)].format = '.3f'
+                
+                fname = self.RES[f_n].name.split(' lambda_c')[0]
+                tab.meta['name{0}'.format(f_n)] = (fname, 'Filter name')
+                tab.meta['pivot{0}'.format(f_n)] = (self.RES[f_n].pivot,
+                                                 'Pivot wavelength, Angstrom')
+            
+            del(extra_tempfilt)
+            del(extra_rest)
+        
+        try:
+            del(coeffs_norm)
+            del(coeffs_draws)
+            del(draws_norm)
+        except UnboundLocalError:
+            pass
+        
+        return tab
+
+
+    def standard_output(self, zbest=None, prior=False, beta_prior=False, UBVJ=DEFAULT_UBVJ_FILTERS, extra_rf_filters=DEFAULT_RF_FILTERS, cosmology=None, simple=False, rf_pad_width=0.5, rf_max_err=0.5, save_fits=True, get_err=True, percentile_limits=[2.5, 16, 50, 84, 97.5], n_proc=0, clip_wavelength=1100, absmag_filters=[271, 272, 274], run_find_peaks=False, use_numba=True, **kwargs):#
         """
         Full output to ``zout.fits`` file.  
         
@@ -4818,6 +5365,9 @@ class PhotoZ(object):
 
         absmag_filters : list
             Optional list of filters to compute absolute (AB) magnitudes
+
+        use_numba : bool
+            Use numba to speed up some calculations
         
         Returns
         -------
@@ -4859,7 +5409,8 @@ class PhotoZ(object):
             renorm_t=renorm_t,
             hess_threshold=hess_threshold,
             n_proc=n_proc, 
-            clip_wavelength=clip_wavelength
+            clip_wavelength=clip_wavelength,
+            use_numba=use_numba,
         )
         
         tab['z_ml'] = self.zbest
@@ -4878,7 +5429,8 @@ class PhotoZ(object):
                 renorm_t=renorm_t,
                 hess_threshold=hess_threshold,
                 n_proc=n_proc,
-                clip_wavelength=clip_wavelength
+                clip_wavelength=clip_wavelength,
+                use_numba=use_numba,
             )
                
         try:
@@ -4946,7 +5498,7 @@ class PhotoZ(object):
                           cosmology=cosmology,
                           rf_pad_width=rf_pad_width, rf_max_err=rf_max_err, 
                           percentile_limits=percentile_limits, 
-                          simple=simple, n_proc=n_proc, **kwargs)
+                          simple=simple, n_proc=n_proc, use_numba=use_numba, **kwargs)
                           
         for col in sps_tab.colnames:
             tab[col] = sps_tab[col]
@@ -4960,7 +5512,8 @@ class PhotoZ(object):
                                rest_kwargs={'percentiles':percentile_limits, 
                                             'pad_width':rf_pad_width, 
                                             'max_err':rf_max_err,
-                                            'simple':simple})
+                                            'simple':simple},
+                                use_numba=use_numba)
             
             for c in absm.colnames:
                 tab[c] = absm[c]
@@ -6111,72 +6664,51 @@ def fit_by_redshift(iz, z, A, fnu_corr, efnu_corr, TEFz, zp, verbose, fitter, re
     return iz, chi2, coeffs
 
 
-def _fit_at_zbest_group(ix, fnu_corr, efnu_corr, zbest, zp, get_err, fitter, renorm_t, hess_threshold, tempfilt, TEF, ARRAY_DTYPE, _self):
+def _fit_at_zbest_group(ix, fnu_corr, efnu_corr, zbest, zp, get_err, fitter, renorm_t, hess_threshold, tempfilt, TEF, ARRAY_DTYPE, threads=0):
     """
     Standalone function for fitting individual objects and getting 
-    coefficients and random draws
+    coefficients and random draws.
     """
-    #TEF, tempfilt = np.load(savefile, allow_pickle=True)
     NOBJ = len(ix)
-    
     NTEMP = tempfilt.NTEMP
+    NFILT = tempfilt.NFILT
     
-    NDRAWS = 100
-    if get_err > 1:
+    coeffs_best = np.zeros((NOBJ, NTEMP), dtype=ARRAY_DTYPE)
+    fmodel = np.zeros((NOBJ, NFILT), dtype=ARRAY_DTYPE)
+    efmodel = np.zeros((NOBJ, NFILT), dtype=ARRAY_DTYPE)
+    chi2_best = np.zeros(NOBJ, dtype=ARRAY_DTYPE)
+    
+    NDRAWS = 0
+    coeffs_draws = None
+    if get_err > 0:
         NDRAWS = int(get_err)
-    else:
-        coeffs_draws = None
-            
-    if _self is None:
-        coeffs_best = np.zeros((NOBJ, tempfilt.NTEMP), dtype=ARRAY_DTYPE)
-        fmodel = np.zeros((NOBJ, tempfilt.NFILT), dtype=ARRAY_DTYPE)
-        efmodel = np.zeros((NOBJ, tempfilt.NFILT), dtype=ARRAY_DTYPE)
-        chi2_best = np.zeros(NOBJ, dtype=ARRAY_DTYPE)
-        if get_err:
-            coeffs_draws = np.zeros((NOBJ, NDRAWS, tempfilt.NTEMP),
-                                dtype=ARRAY_DTYPE)
-    else:
-        # In place, avoid making copies
-        coeffs_best = _self.coeffs_best
-        fmodel = _self.fmodel
-        efmodel = _self.efmodel
-        chi2_best = _self.chi2_best
-        if get_err:
-            coeffs_draws = _self.coeffs_draws
+        coeffs_draws = np.zeros((NOBJ, NDRAWS, NTEMP), dtype=ARRAY_DTYPE)
         
-    idx = np.where((zbest > tempfilt.zgrid[0]) & 
-                   (zbest < tempfilt.zgrid[-1]))[0]
+    idx_iter = np.where((zbest > tempfilt.zgrid[0]) & 
+                        (zbest < tempfilt.zgrid[-1]))[0]
     
-    for iobj in idx:
-        
+    for iobj in idx_iter:
         zi = zbest[iobj]
         A = tempfilt(zi)
         TEFz = TEF(zi)
 
         fnu_i = fnu_corr[iobj, :]
         efnu_i = efnu_corr[iobj,:]
-        if get_err:
-            _ = template_lsq(fnu_i, efnu_i, A, TEFz, zp, NDRAWS, fitter, renorm_t, hess_threshold)
-            chi2, coeffs_best[iobj,:], fmodel[iobj,:], draws = _
-            if draws is None:
-                efmodel[iobj,:] = -1
-            else:
-                #tf = self.tempfilt(zi)
-                efm = np.diff(np.percentile(np.dot(draws, A), [16,84], 
-                                            axis=0), axis=0)/2.
-                efmodel[iobj,:] = efm
-                coeffs_draws[iobj, :, :] = draws
-        else:
-            _ = template_lsq(fnu_i, efnu_i, A, TEFz, zp, False, fitter, renorm_t, hess_threshold)
-            chi2, coeffs_best[iobj,:], fmodel[iobj,:], draws = _
+        
+        _res = template_lsq(fnu_i, efnu_i, A, TEFz, zp, NDRAWS, fitter, 
+                              renorm_t, hess_threshold)
+        chi2, coeffs, fmod, draws = _res
 
         chi2_best[iobj] = chi2
-    
-    if _self is None:
-        return ix, coeffs_best, fmodel, efmodel, chi2_best, coeffs_draws
-    else:
-        return True
-
+        coeffs_best[iobj,:] = coeffs
+        fmodel[iobj,:] = fmod
+        
+        if get_err > 0 and draws is not None:
+            efm = np.diff(np.percentile(np.dot(draws, A), [16,84], axis=0), axis=0)/2.
+            efmodel[iobj,:] = efm
+            coeffs_draws[iobj, :, :] = draws
+            
+    return ix, coeffs_best, fmodel, efmodel, chi2_best, coeffs_draws
 
 def _fit_rest_group(ix, fnu_corr, efnu_corr, izbest, zbest, zp, get_err, fitter, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentiles, rf_lc, pad_width, max_err, threads):
     """
@@ -6561,3 +7093,41 @@ def _fit_rest_group_numba(ix, fnu_corr, efnu_corr, izbest, zbest, zp, renorm_t, 
         )
         
     return ix, f_rest
+
+def _fit_at_zbest_group_numba(ix, fnu_corr, efnu_corr, zbest, zp, get_err,
+                             fitter, renorm_t, hess_threshold,
+                             tempfilt, TEF, ARRAY_DTYPE, threads):
+    """
+    Multiprocessing worker for numba-based fit_at_zbest.
+    """
+    from .numba_utils import _single_object_fit_at_zbest_numba
+    
+    NOBJ = len(ix)
+    NTEMP = tempfilt.NTEMP
+    NFILT = tempfilt.NFILT
+
+    # Initialize output arrays
+    coeffs_best = np.zeros((NOBJ, NTEMP), dtype=ARRAY_DTYPE)
+    fmodel = np.zeros((NOBJ, NFILT), dtype=ARRAY_DTYPE)
+    efmodel = np.zeros((NOBJ, NFILT), dtype=ARRAY_DTYPE)
+    chi2_best = np.zeros(NOBJ, dtype=ARRAY_DTYPE)
+    
+    for iobj in range(NOBJ):
+        z = zbest[iobj]
+        if (z < tempfilt.zgrid[0]) or (z > tempfilt.zgrid[-1]) or not np.isfinite(z):
+            continue
+            
+        A = tempfilt(z)
+        TEFz = TEF(z)
+        
+        chi2, coeffs, fmod, efmod = _single_object_fit_at_zbest_numba(
+            fnu_corr[iobj,:], efnu_corr[iobj,:], A, TEFz, zp, get_err,
+            renorm_t, hess_threshold
+        )
+        
+        coeffs_best[iobj,:] = coeffs
+        fmodel[iobj,:] = fmod
+        efmodel[iobj,:] = efmod
+        chi2_best[iobj] = chi2
+        
+    return ix, coeffs_best, fmodel, efmodel, chi2_best

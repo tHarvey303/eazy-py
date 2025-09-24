@@ -172,10 +172,10 @@ if __name__ == "__main__":
 
     print("Running Numba version of standard_output...")
     start = time.time()
-    ez.standard_output(use_numba=True)
+    ez.standard_output(use_numba=True, vnorm_type=1)
     end = time.time()
     numba_output_time = end - start
-
+    
     print("Running original version of fit_catalog...")
     start = time.time()
     ez.fit_catalog(n_proc=4, get_best_fit=True, prior=False, beta_prior=False, use_numba=False)
@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
     print("Running original version of standard_output...")
     start = time.time()
-    ez.standard_output(use_numba=False)
+    ez.standard_output(use_numba=False, vnorm_type=1)
     end = time.time()
     orig_output_time = end - start
 

@@ -342,3 +342,45 @@ def _rest_frame_fluxes_numba_simple(
             f_rest[iobj, i, :] = np.percentile(dval, percentiles)
             
     return f_rest
+
+@numba.njit(cache=True, fastmath=True)
+def _single_object_fit_at_zbest_numba(
+    fnu_i: NDArray,
+    efnu_i: NDArray,
+    A: NDArray,
+    TEFz: NDArray,
+    zp: NDArray,
+    get_err: bool,
+    renorm_t: bool,
+    hess_threshold: float,
+) -> Tuple[float, NDArray, NDArray, NDArray]:
+    """
+    Numba kernel to fit a single object at its best redshift and get errors.
+    """
+    chi2, coeffs, fmodel, covar = template_lsq_numba_covar(
+        fnu_i, efnu_i, A, TEFz, zp, renorm_t, hess_threshold
+    )
+
+    efmodel = np.zeros_like(fmodel, dtype=fnu_i.dtype)
+    if not get_err:
+        return chi2, coeffs, fmodel, efmodel
+
+    active_mask = coeffs > 0
+    if np.sum(active_mask) > 0 and np.all(np.isfinite(covar)):
+        A_active = A[active_mask, :]
+        
+        # Select sub-matrix from covar for active templates
+        n_active = A_active.shape[0]
+        covar_active = np.zeros((n_active, n_active), dtype=covar.dtype)
+        active_indices = np.where(active_mask)[0]
+        for r_idx, r in enumerate(active_indices):
+            for c_idx, c in enumerate(active_indices):
+                covar_active[r_idx, c_idx] = covar[r, c_idx]
+        
+        # Propagate covariance to model flux: var(f_k) = A_k^T Cov(c) A_k
+        # This is the diagonal of A * Cov(c) * A.T
+        model_covar = np.dot(A_active.T, np.dot(covar_active, A_active))
+        var_fmodel = np.diag(model_covar)
+        efmodel = np.sqrt(var_fmodel)
+
+    return chi2, coeffs, fmodel, efmodel

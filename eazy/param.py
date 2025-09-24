@@ -281,6 +281,10 @@ class TranslateFile:
                 self.trans[k] = tr["trans"][i]
                 self.error[k] = tr["error"][i]
 
+        elif (file is None) | (file == ""):
+            # Just use filtr codes
+            pass
+
         elif file.endswith("csv"):
             tr = Table.read(file)
 

@@ -1557,7 +1557,7 @@ class PhotoZ(object):
         self.fit_catalog(*args, **kwargs)
 
 
-    def fit_catalog(self, idx=None, n_proc=4, verbose=True, get_best_fit=True, prior=False, beta_prior=False, **kwargs):
+    def fit_catalog(self, idx=None, n_proc=4, verbose=True, get_best_fit=True, prior=False, beta_prior=False, use_numba=True, **kwargs):
         """
         This is the main function for fitting redshifts for a full catalog
         and is parallelized by fitting each redshift grid step separately.
@@ -1588,7 +1588,10 @@ class PhotoZ(object):
             Apply apparent magnitude prior
         
         beta_prior : bool
-            Apply UV slope beta priorr
+            Apply UV slope beta prior
+
+        use_numba: bool
+            Use Numba compiled version of NNLS fitter
         
         Returns
         -------
@@ -1626,7 +1629,24 @@ class PhotoZ(object):
         hess_threshold = self.param['HESS_THRESHOLD']
 
         t0 = time.time()
-        if (n_proc == 0) | (mp.cpu_count() == 1):
+        if use_numba:
+            from .numba_utils import fit_by_redshift_dispatcher
+            print("Fitting with Numba core...")
+            np_check = 1
+            for iz, z in tqdm(enumerate(self.zgrid), total=self.NZ):
+                A = self.tempfilt(z)
+                TEFz = self.TEF(z)
+                
+                # Call the JIT-compiled function
+                chi2_z, coeffs_z = fit_by_redshift_dispatcher(
+                    'numba_nnls', A, fnu_corr, efnu_corr, TEFz, self.zp, renorm_t, hess_threshold
+                )
+                
+                self.chi2_fit[idx_fit, iz] = chi2_z
+                self.fit_coeffs[idx_fit, iz, :] = coeffs_z
+
+        
+        elif (n_proc == 0) | (mp.cpu_count() == 1):
             # Serial by redshift
             np_check = 1
             for iz, z in tqdm(enumerate(self.zgrid)):
@@ -2332,11 +2352,12 @@ class PhotoZ(object):
 
                 # Fit spline
                 _yi = (fnu_i[clip][so] - fmodel*corr)*inv_sig[clip][so]
+                print('inputs for lstsq: ', np.nansum(_As), np.sum(_yi), np.sum(fmodel), np.sum(corr))
                 _res = np.linalg.lstsq((_As*fmodel*corr).T, _yi, rcond=None)
+
                 scorr_i = _A[:,self.NFILT:][:,nzs].dot(_res[0])
                 scorr *= (1+_res[0])
                 corr *= 1 + scorr_i
-
                 #_a.plot(lcz[clip][so], 1 + scorr_i, label=f'iter {_iter}')
 
             _yx = (fnu_i[clip][so] - fmodel*corr)*inv_sig[clip][so]
@@ -3414,7 +3435,7 @@ class PhotoZ(object):
         return tab
 
 
-    def rest_frame_fluxes(self, f_numbers=DEFAULT_UBVJ_FILTERS, pad_width=0.5, max_err=0.5, ndraws=1000, percentiles=[2.5,16,50,84,97.5], simple=False, verbose=1, n_proc=-1, par_skip=10000, **kwargs):
+    def rest_frame_fluxes(self, f_numbers=DEFAULT_UBVJ_FILTERS, pad_width=0.5, max_err=0.5, ndraws=1000, percentiles=[2.5,16,50,84,97.5], simple=False, verbose=1, n_proc=-1, par_skip=10000, use_numba=True, **kwargs):
         """
         Rest-frame fluxes, refit by down-weighting bands far away from 
         the desired RF band.
@@ -3491,6 +3512,8 @@ class PhotoZ(object):
             Number of processes to use.  If zero, then run in serial mode.  
             Otherwise, will run in parallel threads splitting the catalog into 
             ``NOBJ/par_skip`` pieces.
+
+        use_numba: Use Numba/JIT compiled functions for improved speed
         
         Returns
         -------
@@ -3506,6 +3529,7 @@ class PhotoZ(object):
         """
         import multiprocessing as mp
         import time
+        from scipy.stats import norm
         
         fitter = self.param['FITTER']
         renorm_t = self.param['RENORM_TEMPLATES'] in utils.TRUE_VALUES
@@ -3524,131 +3548,121 @@ class PhotoZ(object):
             print(fnames)
             
         rf_tempfilt = np.zeros((self.NZ, self.NTEMP, NREST), 
-                       dtype=self.ARRAY_DTYPE)
+                               dtype=self.ARRAY_DTYPE)
         
         rf_lc = np.array([f_i.pivot for f_i in f_list])
         
         for i_t, templ in enumerate(self.templates):
-            # Redshift dependent templates
             iz = np.maximum(templ.zindex(self.zgrid), 0)
             _rf = [templ.integrate_filter(f_list, z=0, iz=i) 
-                     for i in range(templ.NZ)]
+                   for i in range(templ.NZ)]
             
             rf_tempfilt[:, i_t, :] = np.array(_rf)[iz,:]
             
-            
-        # Grid index of best redshfit
         izbest = self.izbest*1
 
         f_rest = np.zeros((self.NOBJ, NREST, len(percentiles)),
-                          dtype=self.ARRAY_DTYPE)
+                           dtype=self.ARRAY_DTYPE)
         f_rest += self.param['NOT_OBS_THRESHOLD'] - 9.
         
         if simple:
-            # Don't refit reweighting filters and get straight 
-            # template fluxes
-            if verbose:
-                print(' ... (simple=True) no filter reweighting')
+            if use_numba:
+                from .numba_utils import _rest_frame_fluxes_numba_simple
+                if verbose:
+                    print(' ... (simple=True, use_numba=True)')
                 
-            coeffsT = np.transpose(self.coeffs_draws, axes=(1,0,2))
+                f_rest = _rest_frame_fluxes_numba_simple(self.coeffs_draws,
+                                                         izbest,
+                                                         rf_tempfilt,
+                                                         np.array(percentiles))
+                return rf_tempfilt, rf_lc, f_rest
+            else:
+                if verbose:
+                    print(' ... (simple=True) no filter reweighting')
+                
+                coeffsT = np.transpose(self.coeffs_draws, axes=(1,0,2))
+                rf_iz = rf_tempfilt[izbest,:,:]
 
-            rf_iz = rf_tempfilt[izbest,:,:]
-
-            for i in range(NREST):
-                f_vals = (coeffsT*rf_iz[:,:,i]).sum(axis=2)
-                f_rest[:,i,:] = np.percentile(f_vals, percentiles, axis=0).T
-            
-            del(coeffsT)
-            del(f_vals)
-            
-            return rf_tempfilt, rf_lc, f_rest  
-                        
+                for i in range(NREST):
+                    f_vals = (coeffsT*rf_iz[:,:,i]).sum(axis=2)
+                    f_rest[:,i,:] = np.percentile(f_vals, percentiles, axis=0).T
+                
+                return rf_tempfilt, rf_lc, f_rest
+        
+        # --- Start of simple=False logic ---
         fnu_corr = self.fnu*self.ext_redden*self.zp
         efnu_corr = self.efnu*self.ext_redden*self.zp
         efnu_corr[~self.ok_data] = self.param['NOT_OBS_THRESHOLD'] - 9.
-                
+        
         idx = self.idx[self.zbest > self.zgrid[0]]
         
-        # Set seed
         np.random.seed(self.random_seed)
         
+        if n_proc < 0:
+            n_proc = np.maximum(mp.cpu_count() - 2, 1)
+
+        t0 = time.time()
+        
+        if use_numba:
+            from .numba_utils import _single_object_rest_fluxes_refit
+
+            percentile_sigma_multipliers = norm.ppf(np.array(percentiles)/100.)
+            
+            worker_func = _fit_rest_group_numba
+            worker_args_tuple = (fnu_corr, efnu_corr, izbest, self.zbest, self.zp*1, 
+                           renorm_t, hess_threshold, self.tempfilt, 
+                           self.ARRAY_DTYPE, rf_tempfilt, 
+                           percentile_sigma_multipliers, rf_lc, self.pivot,
+                           pad_width, max_err)
+        else:
+            worker_func = _fit_rest_group
+            worker_args_tuple = (fnu_corr, efnu_corr, izbest, self.zbest, self.zp*1, 
+                           ndraws, fitter, renorm_t, hess_threshold, 
+                           self.tempfilt, self.ARRAY_DTYPE, rf_tempfilt, 
+                           percentiles, rf_lc, pad_width, max_err)
+
         if (n_proc == 0) | (len(idx) <= par_skip):  
-            # Serial
-            _ = _fit_rest_group(idx, 
-                                fnu_corr[idx,:], 
-                                efnu_corr[idx,:], 
-                                izbest[idx], 
-                                self.zbest[idx], 
-                                self.zp*1, 
-                                ndraws, 
-                                fitter,
-                                renorm_t,
-                                hess_threshold,
-                                self.tempfilt,
-                                self.ARRAY_DTYPE, 
-                                rf_tempfilt, 
-                                percentiles, 
-                                rf_lc,
-                                pad_width,
-                                max_err,
-                                0)
+            # Serial execution
+            np_check = 1
+            # **FIX**: Pass the sliced data arrays to the worker
+            worker_args = (fnu_corr[idx,:], efnu_corr[idx,:], izbest[idx], 
+                           self.zbest[idx]) + worker_args_tuple[4:]
             
-            _ix, _frest = _                
+            _ix, _frest = worker_func(idx, *worker_args, 0)
             f_rest[_ix,:,:] = _frest
-            
-        else:     
-            # Threaded     
-            if n_proc < 0:
-                n_proc = np.maximum(mp.cpu_count() - 2, 1)
-            
+        else:
+            # Parallel execution
             skip = np.maximum(len(idx)//par_skip+1, 1)
-            
-            n_proc = np.minimum(n_proc, skip)
             np_check = np.minimum(mp.cpu_count(), n_proc)
-            
-            t0 = time.time()
+            np_check = np.minimum(np_check, skip)
 
             pool = mp.Pool(processes=np_check)
             jobs = [
-            pool.apply_async(
-                    _fit_rest_group, (
-                        idx[i::skip], 
-                        fnu_corr[idx[i::skip],:], 
-                        efnu_corr[idx[i::skip],:], 
-                        izbest[idx[i::skip]], 
-                        self.zbest[idx[i::skip]], 
-                        self.zp*1, 
-                        ndraws, 
-                        fitter,
-                        renorm_t,
-                        hess_threshold,
-                        self.tempfilt,
-                        self.ARRAY_DTYPE, 
-                        rf_tempfilt,
-                        percentiles, 
-                        rf_lc,
-                        pad_width,
-                        max_err,
-                        skip
-                    )
+                pool.apply_async(
+                    worker_func, 
+                    # **FIX**: Pass sliced data for each chunk
+                    (idx[i::skip],
+                     fnu_corr[idx[i::skip],:], efnu_corr[idx[i::skip],:],
+                     izbest[idx[i::skip]], self.zbest[idx[i::skip]])
+                     + worker_args_tuple[4:],
+                    threads=skip
                 )
                 for i in range(skip)
             ]
-
             pool.close()
-            #pool.join()
 
-            for res in tqdm(jobs):
-                _ = res.get(timeout=MULTIPROCESSING_TIMEOUT)
-                _ix, _frest = _                
+            iterator = tqdm(jobs) if HAS_TQDM else jobs
+            for res in iterator:
+                _ix, _frest = res.get(timeout=MULTIPROCESSING_TIMEOUT)
                 f_rest[_ix,:,:] = _frest
-            #
-            t1 = time.time()
-            print(f' ... rest-frame flux: {t1-t0:.1f} s (n_proc={np_check}, '
-                  f' NOBJ={len(idx)})')
-
-        return rf_tempfilt, rf_lc, f_rest  
-
+            
+            pool.join()
+        
+        t1 = time.time()
+        print(f' ... rest-frame flux ({ "numba" if use_numba else "python" }): '
+              f'{t1-t0:.1f} s (n_proc={np_check}, NOBJ={len(idx)})')
+        
+        return rf_tempfilt, rf_lc, f_rest
 
     def compute_tef_lnp(self, in_place=True):
         """
@@ -6170,39 +6184,35 @@ def _fit_rest_group(ix, fnu_corr, efnu_corr, izbest, zbest, zp, get_err, fitter,
     """
     from tqdm import tqdm
     
-    #TEF, tempfilt = np.load(savefile, allow_pickle=True)
     NOBJ = len(ix)
-    NTEMP = tempfilt.NTEMP    
+    NTEMP = tempfilt.NTEMP   
     NREST = rf_tempfilt.shape[2]
     f_rest = np.zeros((NOBJ, NREST, len(percentiles)),
                       dtype=ARRAY_DTYPE)
     
-    idx = np.where((zbest > tempfilt.zgrid[0]) & 
-                   (zbest < tempfilt.zgrid[-1]))[0]
+    # Valid objects to fit in this chunk
+    mask = (zbest > tempfilt.zgrid[0]) & (zbest < tempfilt.zgrid[-1])
     
-    if threads == 0:
-        iters = tqdm(idx)
-    else:
-        iters = idx  
+    iterator = tqdm(range(NOBJ)) if threads == 0 else range(NOBJ)
     
     NDRAWS = 100
     if get_err > 1:
         NDRAWS = get_err
-                      
-    for iobj in iters:
+                            
+    # **FIX**: Loop over range(NOBJ) and check mask for robustness
+    for iobj in iterator:
+        if not mask[iobj]:
+            continue
 
         fnu_i = fnu_corr[iobj,:]*1
         efnu_i = efnu_corr[iobj,:]*1
         z = zbest[iobj]
-        if (z < 0) | (~np.isfinite(z)):
-            continue
         
         A = tempfilt(z)   
         iz = izbest[iobj]
         
         for i in range(NREST):
             ## Grow uncertainties away from RF band
-            #lc_i = rf_tempfilt.lc[i]
             lc_i = rf_lc[i]
             
             # Normal in log wavelength
@@ -6222,7 +6232,6 @@ def _fit_rest_group(ix, fnu_corr, efnu_corr, izbest, zbest, zp, get_err, fitter,
                 del(dval)
     
     return ix, f_rest
-
 
 #BOUNDED_DEFAULTS = {'bounds':(1.e3, 1.e18), 'method': 'bvls', 'tol': 1.e-8, 'verbose': 0}
 BOUNDED_DEFAULTS = {'bound_range':[0.05, 20], 'method': 'trf', 'tol': 1.e-8, 'verbose': 0, 'normalize_type':0}
@@ -6524,4 +6533,31 @@ def template_lsq(fnu_i, efnu_i, Ain, TEFz, zp, ndraws, fitter, renorm_t, hess_th
 
     return chi2_i, coeffs_i, fmodel, coeffs_draw
 
-
+def _fit_rest_group_numba(ix, fnu_corr, efnu_corr, izbest, zbest, zp, renorm_t, hess_threshold, tempfilt, ARRAY_DTYPE, rf_tempfilt, percentile_sigma_multipliers, rf_lc, pivot, pad_width, max_err, threads):
+    """
+    Multiprocessing worker for numba-based rest-frame flux calculation.
+    """
+    from .numba_utils import _single_object_rest_fluxes_refit
+    from tqdm import tqdm
+    
+    NOBJ = len(ix)
+    NREST = rf_tempfilt.shape[2]
+    f_rest = np.zeros((NOBJ, NREST, len(percentile_sigma_multipliers)), dtype=ARRAY_DTYPE)
+    
+    iterator = tqdm(range(NOBJ)) if threads == 0 else range(NOBJ)
+    
+    for iobj in iterator:
+        z = zbest[iobj]
+        if (z < tempfilt.zgrid[0]) | (z > tempfilt.zgrid[-1]) | (~np.isfinite(z)):
+            continue
+            
+        A = tempfilt(z)
+        iz = izbest[iobj]
+        
+        f_rest[iobj, :, :] = _single_object_rest_fluxes_refit(
+            fnu_corr[iobj,:], efnu_corr[iobj,:], z, A, zp, 
+            rf_tempfilt[iz,:,:], rf_lc, pivot, pad_width, max_err, 
+            renorm_t, hess_threshold, percentile_sigma_multipliers
+        )
+        
+    return ix, f_rest

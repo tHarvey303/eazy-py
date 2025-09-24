@@ -27,6 +27,7 @@ dependencies = [
     "peakutils",
     "scipy",
     "tqdm",
+    "numba"
 ]
 
 [project.optional-dependencies]
